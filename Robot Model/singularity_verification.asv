@@ -1,0 +1,487 @@
+%% ================================================================
+%  Singularity Characterisation + Manipulability Analysis
+%  Proposed 7-DOF Arm — Kinematic Stability Pipeline
+%
+%  Methods incorporated:
+%  1. SVD-based sigma_min (primary singularity criterion)
+%  2. Yoshikawa manipulability (continuous stability measure)
+%  3. Sub-Jacobian determinants via Cauchy-Binet identity
+%     (analytical cross-check — Villalobos et al. [55])
+%  4. Screw dependency classification
+%     (geometric interpretation — Asgari et al. [56])
+%  5. IK feasibility validation (operational threshold)
+%% ================================================================
+
+clear; clc; close all;
+load('Arm.mat');
+
+%% --- Robot Parameters ---
+L = [0.2, 0.2, 1.0, 0.7424, 0.4635, 0.113, 0.106];
+
+%% --- Broad Joint Limits (no rejection) ---
+q_min = [-180, -90, -90, -180, -90, -90, -180]' * pi/180;
+q_max = [ 180,  90,  90,  180,  90,  90,  180]' * pi/180;
+
+%% --- Parameters ---
+N              = 1000000;
+thresh_sing    = 0.01;
+thresh_near    = 0.05;
+thresh_well    = 0.10;
+rng(42);
+
+%% ================================================================
+%  STEP 1 — Uniform Sampling + SVD + Manipulability
+%% ================================================================
+fprintf('Generating %d uniform samples...\n', N);
+Q = q_min + (q_max - q_min) .* rand(7, N);
+
+sigma_min_vals  = zeros(N, 1);
+sigma_max_vals  = zeros(N, 1);
+lci_vals        = zeros(N, 1);
+mu_vals         = zeros(N, 1);      % Yoshikawa manipulability
+mu_sq_cauchy    = zeros(N, 1);      % Cauchy-Binet sum of sub-det^2
+sub_det         = zeros(N, 7);      % all 7 sub-Jacobian determinants
+ee_pos          = zeros(3, N);
+
+fprintf('Computing SVD, manipulability, sub-Jacobian determinants...\n');
+
+for i = 1:N
+    q = Q(:,i);
+    J = Geometric_Jacobian(q, L);
+
+    % SVD
+    sv = svd(J);
+    sigma_min_vals(i) = sv(end);
+    sigma_max_vals(i) = sv(1);
+    lci_vals(i)       = sv(end) / sv(1);
+
+    % Yoshikawa manipulability
+    JJT        = J * J';
+    mu_vals(i) = sqrt(max(0, det(JJT)));
+
+    % Sub-Jacobian determinants (Cauchy-Binet)
+    for k = 1:7
+        cols         = setdiff(1:7, k);
+        sub_det(i,k) = det(J(:, cols));
+    end
+    mu_sq_cauchy(i) = sqrt(max(0, sum(sub_det(i,:).^2)));
+
+    % FK for EE position
+    [T,~,~]    = Forward_Kinematics(q, L);
+    ee_pos(:,i) = T(1:3,4);
+
+    if mod(i, 10000) == 0
+        fprintf('  %d/%d done\n', i, N);
+    end
+end
+
+%% --- Cauchy-Binet Verification ---
+cb_err = abs(mu_vals - mu_sq_cauchy);
+fprintf('\n=== Cauchy-Binet Verification ===\n');
+fprintf('Max |mu - sqrt(sum(det(J_k)^2))| : %.2e\n', max(cb_err));
+fprintf('Mean residual                     : %.2e\n', mean(cb_err));
+fprintf('Identity holds to machine precision: %d\n', max(cb_err) < 1e-8);
+
+%% --- Manipulability statistics ---
+mu_mean   = mean(mu_vals);
+mu_std    = std(mu_vals);
+mu_thresh = mu_mean - 2*mu_std;
+mu_thresh = max(mu_thresh, 0);
+
+fprintf('\n=== Manipulability Statistics ===\n');
+fprintf('Mean mu          : %.4f\n', mu_mean);
+fprintf('Std  mu          : %.4f\n', mu_std);
+fprintf('Threshold (m-2s) : %.4f\n', mu_thresh);
+
+%% --- Classification ---
+is_singular  = sigma_min_vals < thresh_sing;
+is_near_sing = sigma_min_vals >= thresh_sing & sigma_min_vals < thresh_near;
+is_well_cond = sigma_min_vals >= thresh_well;
+is_low_mu    = mu_vals < mu_thresh;
+
+fprintf('\n=== Singularity Classification ===\n');
+fprintf('Singular     (sigma < %.2f) : %d  (%.1f%%)\n', ...
+    thresh_sing, sum(is_singular), 100*mean(is_singular));
+fprintf('Near-sing    (%.2f-%.2f)    : %d  (%.1f%%)\n', ...
+    thresh_sing, thresh_near, sum(is_near_sing), 100*mean(is_near_sing));
+fprintf('Well-cond    (sigma > %.2f) : %d  (%.1f%%)\n', ...
+    thresh_well, sum(is_well_cond), 100*mean(is_well_cond));
+fprintf('Low-mu       (mu < %.4f)   : %d  (%.1f%%)\n', ...
+    mu_thresh, sum(is_low_mu), 100*mean(is_low_mu));
+
+%% ================================================================
+%  STEP 2 — Sub-Jacobian Determinant Analysis
+%% ================================================================
+fprintf('\n=== Sub-Jacobian Determinant Analysis ===\n');
+fprintf('Checking singularity condition: all det(J_{-k}) ~ 0\n\n');
+
+%% Identify configurations where ALL sub-determinants are near zero
+all_sub_zero = all(abs(sub_det) < 0.01, 2);
+fprintf('Configs with all |det(J_{-k})| < 0.01 : %d (%.1f%%)\n', ...
+    sum(all_sub_zero), 100*mean(all_sub_zero));
+
+%% Mean |det(J_{-k})| per joint removal
+fprintf('\nMean |det(J_{-k})| per removed joint:\n');
+for k = 1:7
+    fprintf('  Remove J%d : mean=%.4f  std=%.4f  min=%.4f\n', ...
+        k, mean(abs(sub_det(:,k))), std(abs(sub_det(:,k))), ...
+        min(abs(sub_det(:,k))));
+end
+
+%% Correlation: sub-det vs sigma_min
+fprintf('\nCorrelation |det(J_{-k})| vs sigma_min:\n');
+for k = 1:7
+    r = corr(abs(sub_det(:,k)), sigma_min_vals);
+    fprintf('  J_{-%d} : r = %.4f\n', k, r);
+end
+
+%% ================================================================
+%  STEP 3 — Screw Dependency Classification
+%% ================================================================
+fprintf('\n=== Screw Dependency Classification ===\n');
+fprintf('Identifying two-condition singularity families...\n\n');
+
+%% Elbow lock: primary condition |q4| < 15 deg
+elbow_lock = abs(Q(4,:))' < (15*pi/180);
+
+%% Shoulder singularity: |q2| < 10 deg
+shoulder   = abs(Q(2,:))' < (10*pi/180);
+
+%% Wrist singularity: axes 5 and 7 near parallel
+%% Proxy: J5-J7 axis alignment via dot product of z-axes
+wrist_sing = false(N,1);
+for i = 1:N
+    [~,~,T_all] = Forward_Kinematics(Q(:,i), L);
+    z5 = T_all{5}(1:3,3);
+    z7 = T_all{7}(1:3,3);
+    if abs(dot(z5,z7)) > cos(10*pi/180)
+        wrist_sing(i) = true;
+    end
+end
+
+%% Two-condition combinations (Asgari et al. approach)
+elbow_AND_shoulder = elbow_lock & shoulder;
+elbow_AND_wrist    = elbow_lock & wrist_sing;
+shoulder_AND_wrist = shoulder   & wrist_sing;
+all_three          = elbow_lock & shoulder & wrist_sing;
+
+fprintf('Singularity family classification:\n');
+fprintf('  Elbow lock only          : %d  (%.1f%%)\n', ...
+    sum(elbow_lock & ~shoulder & ~wrist_sing), ...
+    100*mean(elbow_lock & ~shoulder & ~wrist_sing));
+fprintf('  Shoulder only            : %d  (%.1f%%)\n', ...
+    sum(shoulder & ~elbow_lock & ~wrist_sing), ...
+    100*mean(shoulder & ~elbow_lock & ~wrist_sing));
+fprintf('  Wrist only               : %d  (%.1f%%)\n', ...
+    sum(wrist_sing & ~elbow_lock & ~shoulder), ...
+    100*mean(wrist_sing & ~elbow_lock & ~shoulder));
+fprintf('  Elbow + Shoulder (Cat A) : %d  (%.1f%%)\n', ...
+    sum(elbow_AND_shoulder), 100*mean(elbow_AND_shoulder));
+fprintf('  Elbow + Wrist    (Cat B) : %d  (%.1f%%)\n', ...
+    sum(elbow_AND_wrist), 100*mean(elbow_AND_wrist));
+fprintf('  Shoulder + Wrist         : %d  (%.1f%%)\n', ...
+    sum(shoulder_AND_wrist), 100*mean(shoulder_AND_wrist));
+fprintf('  All three (Cat A+B)      : %d  (%.1f%%)\n', ...
+    sum(all_three), 100*mean(all_three));
+
+%% ================================================================
+%  STEP 4 — IK Feasibility + Manipulability Threshold
+%% ================================================================
+fprintf('\nRunning IK feasibility check...\n');
+N_ik       = 3000;
+ik_indices = round(linspace(1, N, N_ik));
+pert_mag   = 0.1;
+
+ik_converged = false(N_ik, 1);
+ik_pos_err   = zeros(N_ik, 1);
+ik_sigma     = zeros(N_ik, 1);
+ik_mu        = zeros(N_ik, 1);
+ik_lci       = zeros(N_ik, 1);
+
+for idx = 1:N_ik
+    i           = ik_indices(idx);
+    q_true      = Q(:,i);
+    [T_des,~,~] = Forward_Kinematics(q_true, L);
+    p_des       = T_des(1:3,4);
+    R_des       = T_des(1:3,1:3);
+    q_init      = q_true + pert_mag * randn(7,1);
+    [~, conv, ~, pe, ~] = DLS(q_init, L, p_des, R_des);
+    ik_converged(idx) = conv;
+    ik_pos_err(idx)   = pe;
+    ik_sigma(idx)     = sigma_min_vals(i);
+    ik_mu(idx)        = mu_vals(i);
+    ik_lci(idx)       = lci_vals(i);
+    if mod(idx, 500) == 0
+        fprintf('  IK check %d/%d\n', idx, N_ik);
+    end
+end
+
+%% Find mu threshold from IK convergence
+mu_edges = linspace(0, prctile(ik_mu, 99), 30);
+mu_ctrs  = 0.5*(mu_edges(1:end-1) + mu_edges(2:end));
+mu_conv_rate = zeros(length(mu_ctrs),1);
+for b = 1:length(mu_ctrs)
+    in_bin = ik_mu >= mu_edges(b) & ik_mu < mu_edges(b+1);
+    if sum(in_bin) > 0
+        mu_conv_rate(b) = mean(ik_converged(in_bin)) * 100;
+    end
+end
+
+%% Find mu value where convergence first reaches 100%
+mu_stable_idx  = find(mu_conv_rate >= 99, 1, 'first');
+mu_stable_thresh = mu_ctrs(mu_stable_idx);
+
+fprintf('\n=== IK Feasibility Results ===\n');
+sing_mask = ik_sigma < thresh_sing;
+near_mask = ik_sigma >= thresh_sing & ik_sigma < thresh_near;
+well_mask = ik_sigma >= thresh_near;
+
+fprintf('Singular region  : IK conv = %.1f%%\n', 100*mean(ik_converged(sing_mask)));
+fprintf('Near-sing region : IK conv = %.1f%%\n', 100*mean(ik_converged(near_mask)));
+fprintf('Well-cond region : IK conv = %.1f%%\n', 100*mean(ik_converged(well_mask)));
+fprintf('mu stable thresh : %.4f (IK conv >= 99%%)\n', mu_stable_thresh);
+
+%% ================================================================
+%  FIGURES
+%% ================================================================
+
+%% --- Figure 1: sigma_min histogram ---
+figure('Color','w','Position',[50 50 800 500]);
+histogram(sigma_min_vals, 80, 'FaceColor',[0.2 0.5 0.8], ...
+    'EdgeColor','none','FaceAlpha',0.8);
+hold on;
+xline(thresh_sing,  'r-',  'Singular',    'LineWidth',2,'FontSize',10, ...
+    'LabelVerticalAlignment','bottom');
+xline(thresh_near,  'm--', 'Near-Sing',   'LineWidth',2,'FontSize',10, ...
+    'LabelVerticalAlignment','bottom');
+xline(thresh_well,  'g--', 'Operational', 'LineWidth',2,'FontSize',10, ...
+    'LabelVerticalAlignment','bottom');
+xlabel('\sigma_{min}','FontSize',13);
+ylabel('Count','FontSize',13);
+title('Distribution of \sigma_{min} — Full Joint Space','FontSize',13,'FontWeight','bold');
+grid on; box off;
+saveas(gcf,'Sing_Histogram.png');
+
+%% --- Figure 2: Manipulability histogram ---
+figure('Color','w','Position',[900 50 800 500]);
+histogram(mu_vals, 80, 'FaceColor',[0.8 0.4 0.2], ...
+    'EdgeColor','none','FaceAlpha',0.8);
+hold on;
+xline(mu_stable_thresh, 'r-', sprintf('\\mu_{thresh}=%.3f', mu_stable_thresh), ...
+    'LineWidth',2,'FontSize',10,'LabelVerticalAlignment','bottom');
+xline(mu_mean, 'g--', sprintf('Mean=%.3f', mu_mean), ...
+    'LineWidth',2,'FontSize',10,'LabelVerticalAlignment','bottom');
+xlabel('\mu (Manipulability)','FontSize',13);
+ylabel('Count','FontSize',13);
+title('Distribution of Yoshikawa Manipulability — Full Joint Space', ...
+    'FontSize',13,'FontWeight','bold');
+grid on; box off;
+saveas(gcf,'Manip_Histogram.png');
+
+%% --- Figure 3: mu vs sigma_min correlation ---
+figure('Color','w','Position',[50 600 800 500]);
+scatter(sigma_min_vals, mu_vals, 4, lci_vals, 'filled','MarkerFaceAlpha',0.3);
+colormap(jet); cb = colorbar;
+cb.Label.String = 'LCI'; cb.Label.FontSize = 11;
+hold on;
+xline(thresh_near, 'm--', '\sigma threshold','LineWidth',1.5,'FontSize',9);
+yline(mu_stable_thresh, 'r-', '\mu threshold','LineWidth',1.5,'FontSize',9);
+xlabel('\sigma_{min}','FontSize',12);
+ylabel('\mu (Manipulability)','FontSize',12);
+title('\mu vs \sigma_{min} — Kinematic Stability Correlation', ...
+    'FontSize',13,'FontWeight','bold');
+grid on; box off;
+saveas(gcf,'Manip_vs_Sigma.png');
+
+%% --- Figure 4: mu vs q4 (elbow lock effect) ---
+figure('Color','w','Position',[900 600 800 500]);
+scatter(rad2deg(Q(4,:)), mu_vals, 4, sigma_min_vals, ...
+    'filled','MarkerFaceAlpha',0.4);
+colormap(jet); cb = colorbar;
+cb.Label.String = '\sigma_{min}'; cb.Label.FontSize = 11;
+hold on;
+xline(0,   'r-',  'q4=0',    'LineWidth',2,'FontSize',9);
+xline(15,  'r--', '|q4|=15°','LineWidth',1.5,'FontSize',9);
+xline(-15, 'r--', '',        'LineWidth',1.5);
+yline(mu_stable_thresh,'k-','\mu threshold','LineWidth',1.5,'FontSize',9);
+xlabel('q_4 (deg)','FontSize',12);
+ylabel('\mu (Manipulability)','FontSize',12);
+title('\mu vs Elbow Joint q_4 — Elbow Lock Effect on Manipulability', ...
+    'FontSize',13,'FontWeight','bold');
+grid on; box off;
+saveas(gcf,'Manip_vs_q4.png');
+
+%% --- Figure 5: mu heat map in (q2,q4) plane ---
+figure('Color','w','Position',[50 50 800 650]);
+scatter(rad2deg(Q(4,:)), rad2deg(Q(2,:)), 5, mu_vals, ...
+    'filled','MarkerFaceAlpha',0.5);
+colormap(hot); cb = colorbar;
+cb.Label.String = '\mu'; cb.Label.FontSize = 11;
+hold on;
+xline(0,   'w-',  'q4=0',  'LineWidth',2,'FontSize',9);
+xline(15,  'w--', '|q4|=15°','LineWidth',1.5,'FontSize',9);
+xline(-15, 'w--', '',      'LineWidth',1.5);
+yline(0,   'c-',  'q2=0',  'LineWidth',2,'FontSize',9);
+xlabel('q_4 (deg)','FontSize',12);
+ylabel('q_2 (deg)','FontSize',12);
+title('Manipulability Heat Map — (q_2, q_4) Plane', ...
+    'FontSize',13,'FontWeight','bold');
+grid on; box off;
+saveas(gcf,'Manip_Heatmap.png');
+
+%% --- Figure 6: Sub-Jacobian determinants ---
+figure('Color','w','Position',[900 50 1200 500]);
+for k = 1:7
+    subplot(2,4,k);
+    histogram(abs(sub_det(:,k)), 60, ...
+        'FaceColor',[0.2+0.1*k, 0.5, 0.8-0.05*k], ...
+        'EdgeColor','none','FaceAlpha',0.8);
+    hold on;
+    xline(0.01,'r-','LineWidth',1.5);
+    xlabel(sprintf('|det(J_{-%d})|',k),'FontSize',10);
+    ylabel('Count','FontSize',10);
+    title(sprintf('Remove J%d',k),'FontSize',11,'FontWeight','bold');
+    grid on; box off;
+end
+sgtitle('Sub-Jacobian Determinant Distributions — Cauchy-Binet Analysis', ...
+    'FontSize',13,'FontWeight','bold');
+saveas(gcf,'SubJac_Determinants.png');
+
+%% --- Figure 7: Screw dependency classification in workspace ---
+figure('Color','k','Position',[50 50 1000 700]);
+hold on;
+
+% Well conditioned
+scatter3(ee_pos(1,is_well_cond), ee_pos(2,is_well_cond), ...
+    ee_pos(3,is_well_cond), 3, 'c', 'filled','MarkerFaceAlpha',0.15, ...
+    'DisplayName','Well-Conditioned');
+
+% Elbow lock only
+el_only = elbow_lock & ~shoulder & ~wrist_sing;
+scatter3(ee_pos(1,el_only), ee_pos(2,el_only), ee_pos(3,el_only), ...
+    8, 'r', 'filled','MarkerFaceAlpha',0.8, ...
+    'DisplayName','Elbow Lock (Cat A)');
+
+% Shoulder only
+sh_only = shoulder & ~elbow_lock & ~wrist_sing;
+scatter3(ee_pos(1,sh_only), ee_pos(2,sh_only), ee_pos(3,sh_only), ...
+    8, 'y', 'filled','MarkerFaceAlpha',0.8, ...
+    'DisplayName','Shoulder (Cat A first cond)');
+
+% Wrist only
+wr_only = wrist_sing & ~elbow_lock & ~shoulder;
+scatter3(ee_pos(1,wr_only), ee_pos(2,wr_only), ee_pos(3,wr_only), ...
+    8, 'm', 'filled','MarkerFaceAlpha',0.8, ...
+    'DisplayName','Wrist (Cat B first cond)');
+
+% Two-condition combinations
+scatter3(ee_pos(1,elbow_AND_shoulder), ee_pos(2,elbow_AND_shoulder), ...
+    ee_pos(3,elbow_AND_shoulder), 12, 'w', 'filled','MarkerFaceAlpha',1.0, ...
+    'DisplayName','Cat A (Elbow+Shoulder)');
+
+xlabel('X (m)','Color','w','FontSize',11);
+ylabel('Y (m)','Color','w','FontSize',11);
+zlabel('Z (m)','Color','w','FontSize',11);
+title('Workspace — Screw Dependency Classification','Color','w','FontSize',13);
+legend('TextColor','w','Color','k','Location','best','FontSize',9);
+ax = gca;
+ax.Color = 'k'; ax.XColor = 'w';
+ax.YColor = 'w'; ax.ZColor = 'w';
+ax.GridColor = 'w'; grid on; axis equal; view(45,25);
+saveas(gcf,'Sing_ScewDep_Workspace.png');
+
+%% --- Figure 8: IK feasibility dashboard ---
+figure('Color','w','Position',[50 50 1400 500]);
+
+% Panel 1: mu vs sigma_min coloured by IK convergence
+subplot(1,4,1);
+scatter(ik_sigma, ik_mu, 6, ik_converged, 'filled','MarkerFaceAlpha',0.7);
+colormap([1 0 0; 0 0.7 0]);
+xline(thresh_near,'m--','LineWidth',1.5);
+yline(mu_stable_thresh,'r-','LineWidth',1.5);
+xlabel('\sigma_{min}','FontSize',11);
+ylabel('\mu','FontSize',11);
+title('IK Conv in (\sigma_{min}, \mu) Space','FontSize',11,'FontWeight','bold');
+grid on; box off;
+
+% Panel 2: sigma_min convergence rate
+subplot(1,4,2);
+edges   = linspace(0, max(ik_sigma), 25);
+ctrs    = 0.5*(edges(1:end-1)+edges(2:end));
+conv_s  = zeros(length(ctrs),1);
+for b   = 1:length(ctrs)
+    in  = ik_sigma >= edges(b) & ik_sigma < edges(b+1);
+    if sum(in) > 0, conv_s(b) = mean(ik_converged(in))*100; end
+end
+bar(ctrs, conv_s,'FaceColor',[0.2 0.6 0.8],'EdgeColor','none');
+hold on;
+xline(thresh_sing, 'r-', 'LineWidth',2);
+xline(thresh_near, 'm--','LineWidth',2);
+xlabel('\sigma_{min}','FontSize',11);
+ylabel('IK Conv Rate (%)','FontSize',11);
+title('Conv Rate vs \sigma_{min}','FontSize',11,'FontWeight','bold');
+ylim([0 110]); grid on; box off;
+
+% Panel 3: mu convergence rate
+subplot(1,4,3);
+bar(mu_ctrs, mu_conv_rate,'FaceColor',[0.8 0.4 0.2],'EdgeColor','none');
+hold on;
+xline(mu_stable_thresh,'r-',sprintf('\\mu=%.3f',mu_stable_thresh),...
+    'LineWidth',2,'FontSize',9);
+xlabel('\mu','FontSize',11);
+ylabel('IK Conv Rate (%)','FontSize',11);
+title('Conv Rate vs \mu','FontSize',11,'FontWeight','bold');
+ylim([0 110]); grid on; box off;
+
+% Panel 4: IK convergence in (q4, sigma_min) space
+subplot(1,4,4);
+scatter(rad2deg(Q(4,ik_indices)), ik_sigma, 6, ik_converged, ...
+    'filled','MarkerFaceAlpha',0.6);
+colormap([1 0 0; 0 0.7 0]);
+hold on;
+xline(0,   'r-',  'LineWidth',2);
+xline(15,  'r--', 'LineWidth',1.5);
+xline(-15, 'r--', 'LineWidth',1.5);
+yline(thresh_near,'m--','LineWidth',1.5);
+xlabel('q_4 (deg)','FontSize',11);
+ylabel('\sigma_{min}','FontSize',11);
+title('IK Conv in (q_4,\sigma_{min}) Space','FontSize',11,'FontWeight','bold');
+grid on; box off;
+
+sgtitle('Kinematic Stability — IK Feasibility Dashboard', ...
+    'FontSize',13,'FontWeight','bold');
+saveas(gcf,'Stability_Dashboard.png');
+
+%% ================================================================
+%  STEP 5 — Kinematic Stability Summary
+%% ================================================================
+fprintf('\n================================================================\n');
+fprintf('  KINEMATIC STABILITY THRESHOLDS — PROPOSED 7-DOF ARM\n');
+fprintf('================================================================\n');
+fprintf('\nPrimary exclusion criteria (must ALL be satisfied):\n');
+fprintf('  1. Elbow exclusion zone : |q4| > 15 deg\n');
+fprintf('  2. SVD threshold        : sigma_min > %.2f\n', thresh_near);
+fprintf('  3. Manipulability       : mu > %.4f\n', mu_stable_thresh);
+fprintf('\nSingularity family classification (Asgari et al. framework):\n');
+fprintf('  Category A (elbow lock, q4~0)       : primary condition\n');
+fprintf('  Category B (wrist, q6~0)             : secondary condition\n');
+fprintf('  Category A+B (combined)              : worst case\n');
+fprintf('\nSub-Jacobian analysis (Villalobos et al. framework):\n');
+for k = 1:7
+    frac_near_zero = mean(abs(sub_det(:,k)) < 0.01) * 100;
+    fprintf('  det(J_{-%d}) near zero : %.1f%% of samples\n', k, frac_near_zero);
+end
+fprintf('\nOperational workspace fraction:\n');
+stable = sigma_min_vals > thresh_near & mu_vals > mu_stable_thresh;
+fprintf('  sigma_min > %.2f AND mu > %.4f : %.1f%%\n', ...
+    thresh_near, mu_stable_thresh, 100*mean(stable));
+fprintf('\nFigures saved:\n');
+fprintf('  Sing_Histogram.png\n');
+fprintf('  Manip_Histogram.png\n');
+fprintf('  Manip_vs_Sigma.png\n');
+fprintf('  Manip_vs_q4.png\n');
+fprintf('  Manip_Heatmap.png\n');
+fprintf('  SubJac_Determinants.png\n');
+fprintf('  Sing_ScewDep_Workspace.png\n');
+fprintf('  Stability_Dashboard.png\n');
+fprintf('================================================================\n');
